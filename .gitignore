@@ -1,0 +1,10 @@
+myenv/
+__pycache__/
+*.pyc
+.DS_Store
+output_images/
+.env
+myenv/
+myenv/
+__pycache__/
+*.pyc
