@@ -15,7 +15,7 @@ Usage:
     
     # With arguments
     python capture_all.py --input "./slides" --output "./images"
-    python capture_all.py -i "./slides" -o "./images"
+    python capture_all.py -i "./slides" -o "./images" -c ".slide"
 """
 
 import os
@@ -70,6 +70,34 @@ def get_user_input_paths():
     return str(source_path), str(output_path)
 
 
+def get_user_input_class():
+    """
+    Hỏi user nhập tên class của slide
+    
+    Returns:
+        str or None: Class selector hoặc None nếu user muốn auto-detect
+    """
+    print("\n🎯 Thiết lập slide selector:")
+    print("─" * 60)
+    print("💡 Ví dụ: .slide, .page, section, .my-slide-class")
+    print("   Nếu bỏ trống, hệ thống sẽ tự động detect class name.\n")
+    
+    user_class = input("Nhập tên class/selector của slide (Enter = auto-detect): ").strip()
+    
+    if not user_class:
+        print("✅ Sẽ sử dụng Auto-detect")
+        return None
+    
+    # Normalize: thêm dấu chấm nếu user nhập class name không có dấu chấm
+    # và không phải là tag selector (như section, div)
+    if not user_class.startswith('.') and not user_class.startswith('[') and user_class not in ['section', 'div', 'article', 'main']:
+        user_class = f".{user_class}"
+        print(f"   📝 Đã normalize thành: {user_class}")
+    
+    print(f"✅ Sẽ sử dụng selector: {user_class}")
+    return user_class
+
+
 def parse_arguments():
     """
     Parse command line arguments
@@ -87,7 +115,10 @@ Examples:
   
   # With arguments
   python capture_all.py --input "./slides" --output "./images"
-  python capture_all.py -i "./slides" -o "./images"
+  python capture_all.py -i "./slides" -o "./images" -c ".slide"
+  
+  # Specify class selector
+  python capture_all.py -i "./slides" -o "./images" --class ".my-slide"
         """
     )
     
@@ -103,6 +134,14 @@ Examples:
         type=str,
         default=None,
         help="Đường dẫn thư mục lưu ảnh (default: hỏi user hoặc 'output_images')"
+    )
+    
+    parser.add_argument(
+        "-c", "--class-selector",
+        type=str,
+        default=None,
+        dest="class_selector",
+        help="CSS selector cho slide (vd: .slide, section). Nếu không chỉ định sẽ auto-detect"
     )
     
     parser.add_argument(
@@ -144,10 +183,10 @@ def detect_slide_class(page: Page) -> tuple[str, int]:
     Auto-detect slide class name bằng cách phân tích cấu trúc HTML
     
     Strategy:
-    1. Tìm tất cả div trong body
-    2. Lấy class đầu tiên của mỗi div
-    3. Tìm class xuất hiện nhiều lần nhất (likely là slide class)
-    4. Validate bằng cách check số lượng elements
+    1. Ưu tiên body > div trực tiếp (slide thường là con trực tiếp của body)
+    2. Loại bỏ các class trong blacklist (watermark, overlay, modal, etc.)
+    3. Ưu tiên class có chứa keyword như "slide", "container", "page"
+    4. Check kích thước element (slide thường có width/height lớn)
     
     Args:
         page: Playwright page instance
@@ -157,79 +196,170 @@ def detect_slide_class(page: Page) -> tuple[str, int]:
     """
     print("\n🔍 Auto-detecting slide class name...")
     
+    # Blacklist các class thường dùng cho overlay/watermark/decorative elements
+    BLACKLIST_KEYWORDS = [
+        'watermark', 'overlay', 'modal', 'popup', 'tooltip', 'backdrop',
+        'background', 'bg-', 'loading', 'spinner', 'notification', 'toast',
+        'header', 'footer', 'nav', 'menu', 'sidebar', 'hidden', 'invisible',
+        'fixed', 'absolute', 'sticky'
+    ]
+    
+    # Whitelist keywords ưu tiên (các từ thường dùng cho slide)
+    PRIORITY_KEYWORDS = [
+        'slide', 'container', 'page', 'screen', 'card', 'section', 'panel',
+        'content', 'main', 'wrapper', 'item', 'block'
+    ]
+    
     try:
-        # Lấy tất cả các class name từ body > div (hoặc các container chính)
-        # JavaScript để lấy class đầu tiên của các div
+        # Phân tích sâu hơn với JavaScript
         class_analysis = page.evaluate("""
-            () => {
-                // Lấy tất cả div trong body
-                const divs = document.querySelectorAll('body > div, body > div > div, body > main > div');
-                const classMap = {};
+            (config) => {
+                const { blacklistKeywords, priorityKeywords } = config;
                 
-                divs.forEach(div => {
-                    // Lấy class đầu tiên (nếu có)
+                // Chỉ lấy body > div trực tiếp (level 1)
+                const directChildren = document.querySelectorAll('body > div');
+                const classMap = {};
+                const classInfo = {};
+                
+                directChildren.forEach(div => {
                     if (div.classList.length > 0) {
                         const firstClass = div.classList[0];
+                        
+                        // Bỏ qua nếu class chứa blacklist keyword
+                        const isBlacklisted = blacklistKeywords.some(keyword => 
+                            firstClass.toLowerCase().includes(keyword.toLowerCase())
+                        );
+                        
+                        if (isBlacklisted) return;
+                        
+                        // Đếm số lượng
                         classMap[firstClass] = (classMap[firstClass] || 0) + 1;
+                        
+                        // Lưu thông tin về kích thước (chỉ lưu 1 lần)
+                        if (!classInfo[firstClass]) {
+                            const rect = div.getBoundingClientRect();
+                            const hasPriority = priorityKeywords.some(keyword =>
+                                firstClass.toLowerCase().includes(keyword.toLowerCase())
+                            );
+                            classInfo[firstClass] = {
+                                width: rect.width,
+                                height: rect.height,
+                                hasPriority: hasPriority
+                            };
+                        }
                     }
                 });
                 
-                return classMap;
+                return { classMap, classInfo };
             }
-        """)
+        """, {"blacklistKeywords": BLACKLIST_KEYWORDS, "priorityKeywords": PRIORITY_KEYWORDS})
         
-        if not class_analysis:
-            print("   ⚠️  No div with classes found")
+        class_map = class_analysis.get('classMap', {})
+        class_info = class_analysis.get('classInfo', {})
+        
+        if not class_map:
+            print("   ⚠️  No valid div with classes found (after filtering)")
             return None, 0
         
-        print(f"   📊 Class distribution:")
-        for cls, count in sorted(class_analysis.items(), key=lambda x: x[1], reverse=True):
-            print(f"      .{cls}: {count} elements")
+        print(f"   📊 Class distribution (filtered):")
+        for cls, count in sorted(class_map.items(), key=lambda x: x[1], reverse=True):
+            info = class_info.get(cls, {})
+            priority_mark = "⭐" if info.get('hasPriority') else ""
+            size_info = f"({info.get('width', 0):.0f}x{info.get('height', 0):.0f})" if info else ""
+            print(f"      .{cls}: {count} elements {size_info} {priority_mark}")
         
-        # Tìm class xuất hiện nhiều nhất
-        most_common_class = max(class_analysis.items(), key=lambda x: x[1])
-        class_name, count = most_common_class
+        # Scoring system để chọn class tốt nhất
+        def calculate_score(class_name, count, info):
+            score = count * 10  # Base score từ số lượng
+            
+            # Bonus nếu có priority keyword
+            if info.get('hasPriority'):
+                score += 50
+            
+            # Bonus nếu element có kích thước lớn (likely là slide)
+            width = info.get('width', 0)
+            height = info.get('height', 0)
+            if width >= 500 and height >= 500:
+                score += 30
+            elif width >= 300 and height >= 300:
+                score += 15
+            
+            return score
         
-        # Validate: phải có ít nhất 2 elements cùng class
-        if count < 2:
-            print(f"   ⚠️  Class '.{class_name}' only has {count} element(s)")
-            print("   💡 Trying alternative detection methods...")
+        # Tính score cho mỗi class
+        scored_classes = []
+        for cls, count in class_map.items():
+            info = class_info.get(cls, {})
+            score = calculate_score(cls, count, info)
+            scored_classes.append((cls, count, score))
+        
+        # Sort theo score giảm dần
+        scored_classes.sort(key=lambda x: x[2], reverse=True)
+        
+        if scored_classes:
+            best_class, count, score = scored_classes[0]
             
-            # Alternative: tìm bất kỳ elements nào có pattern giống slide
-            alternative_selectors = [
-                'section', 
-                '[class*="slide"]', 
-                '[class*="page"]',
-                '[class*="screen"]',
-                'body > div'
-            ]
-            
-            for selector in alternative_selectors:
+            # Validate: phải có ít nhất 2 elements
+            if count >= 2:
+                print(f"   ✅ Detected slide class: '.{best_class}' ({count} elements, score: {score})")
+                return f".{best_class}", count
+            else:
+                print(f"   ⚠️  Best class '.{best_class}' only has {count} element(s)")
+        
+        # Fallback: thử các selector phổ biến
+        print("   💡 Trying alternative detection methods...")
+        alternative_selectors = [
+            '[class*="slide"]', 
+            '[class*="container"]',
+            '[class*="page"]',
+            'section',
+            '[class*="screen"]',
+            'body > div'
+        ]
+        
+        for selector in alternative_selectors:
+            try:
                 elements = page.locator(selector).all()
                 if len(elements) >= 2:
                     print(f"   ✅ Found {len(elements)} elements with selector: {selector}")
                     return selector, len(elements)
-            
-            return None, 0
+            except:
+                continue
         
-        print(f"   ✅ Detected slide class: '.{class_name}' ({count} elements)")
-        return f".{class_name}", count
+        return None, 0
         
     except Exception as e:
         print(f"   ❌ Error during detection: {str(e)}")
         return None, 0
 
 
-def get_slide_selector_with_fallback(page: Page) -> tuple[str, int]:
+def get_slide_selector_with_fallback(page: Page, user_selector: str = None) -> tuple[str, int]:
     """
     Lấy slide selector với fallback strategies
     
     Args:
         page: Playwright page instance
+        user_selector: Selector do user chỉ định (nếu có)
     
     Returns:
         tuple: (selector, count)
     """
+    # Strategy 0: Nếu user đã chỉ định selector, ưu tiên dùng
+    if user_selector:
+        print(f"\n🎯 Using user-specified selector: {user_selector}")
+        try:
+            elements = page.locator(user_selector).all()
+            count = len(elements)
+            if count > 0:
+                print(f"   ✅ Found {count} element(s) with selector: {user_selector}")
+                return user_selector, count
+            else:
+                print(f"   ⚠️  No elements found with selector: {user_selector}")
+                print("   💡 Falling back to auto-detection...")
+        except Exception as e:
+            print(f"   ❌ Error with selector '{user_selector}': {str(e)}")
+            print("   💡 Falling back to auto-detection...")
+    
     # Strategy 1: Auto-detect từ class name
     selector, count = detect_slide_class(page)
     
@@ -264,16 +394,18 @@ def get_slide_selector_with_fallback(page: Page) -> tuple[str, int]:
 class SlideCaptureBatchProcessor:
     """Handles batch processing of HTML slide files for screenshot capture"""
 
-    def __init__(self, source_dir: str = ".", output_base_dir: str = "output_images"):
+    def __init__(self, source_dir: str = ".", output_base_dir: str = "output_images", slide_selector: str = None):
         """
         Initialize the batch processor
 
         Args:
             source_dir: Directory to scan for HTML files
             output_base_dir: Base directory for output images
+            slide_selector: CSS selector for slides (None = auto-detect)
         """
         self.source_dir = Path(source_dir).resolve()
         self.output_base_dir = Path(output_base_dir).resolve()
+        self.slide_selector = slide_selector
         self.html_files = []
         self.global_slide_counter = 0
 
@@ -322,8 +454,8 @@ class SlideCaptureBatchProcessor:
             print("Waiting for page to render (3 seconds)...")
             page.wait_for_timeout(3000)
 
-            # Auto-detect slide selector
-            selector, slide_count = get_slide_selector_with_fallback(page)
+            # Get slide selector (user-specified or auto-detect)
+            selector, slide_count = get_slide_selector_with_fallback(page, self.slide_selector)
             
             if not selector or slide_count == 0:
                 print("❌ Cannot find slide elements in this file")
@@ -368,6 +500,10 @@ class SlideCaptureBatchProcessor:
         print(f"\n{'='*60}")
         print(f"🚀 STARTING BATCH PROCESSING")
         print(f"Output folder: {self.output_base_dir}")
+        if self.slide_selector:
+            print(f"Slide selector: {self.slide_selector}")
+        else:
+            print(f"Slide selector: Auto-detect")
         print(f"{'='*60}")
 
         with sync_playwright() as p:
@@ -407,12 +543,19 @@ def main():
 
     args = parse_arguments()
     
+    # Xác định slide selector
+    slide_selector = None
+    
     if args.input and args.output:
+        # Command line mode
         source_dir = args.input
         output_dir = args.output
+        slide_selector = args.class_selector
+        
         print(f"📂 Using command line arguments:")
         print(f"   Input:  {source_dir}")
         print(f"   Output: {output_dir}")
+        print(f"   Selector: {slide_selector if slide_selector else 'Auto-detect'}")
         
         try:
             validate_directory(source_dir, "input")
@@ -421,18 +564,25 @@ def main():
             return
             
     elif args.no_interactive:
+        # Non-interactive mode with defaults
         source_dir = "."
         output_dir = "output_images"
+        slide_selector = args.class_selector
+        
         print(f"📂 Using default paths:")
         print(f"   Input:  {source_dir}")
         print(f"   Output: {output_dir}")
+        print(f"   Selector: {slide_selector if slide_selector else 'Auto-detect'}")
         
     else:
+        # Interactive mode
         source_dir, output_dir = get_user_input_paths()
+        slide_selector = get_user_input_class()
 
     processor = SlideCaptureBatchProcessor(
         source_dir=source_dir,
-        output_base_dir=output_dir
+        output_base_dir=output_dir,
+        slide_selector=slide_selector
     )
 
     processor.process_all()
